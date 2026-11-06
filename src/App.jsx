@@ -16,6 +16,7 @@ export default function App() {
   const { groups, devices } = state.data;
 
   useEffect(() => {
+    if (state.loading) return;
     const id = setInterval(() => {
       let changed = false;
       const newDevices = state.data.devices.map((d) => {
@@ -33,7 +34,7 @@ export default function App() {
       }
     }, 20000);
     return () => clearInterval(id);
-  }, [state.data.devices, dispatch]);
+  }, [state.data.devices, state.loading, dispatch]);
 
   let sections;
   if (filter === 'all') {
@@ -58,6 +59,14 @@ export default function App() {
       },
     });
   };
+
+  if (state.loading) {
+    return (
+      <div style={{ display: 'grid', placeItems: 'center', height: '100vh', color: 'var(--muted)' }}>
+        Loading...
+      </div>
+    );
+  }
 
   return (
     <>
@@ -86,7 +95,7 @@ export default function App() {
             ))}
           </div>
           <div className="foot">
-            Example devices for this prototype. Changes are kept in this browser only.{' '}
+            Example devices for this prototype. Changes are stored in MongoDB.{' '}
             <button onClick={() => dispatch({ type: 'RESET' })}>Reset example home</button>
           </div>
         </main>
