@@ -1,5 +1,6 @@
 import { useEffect } from 'react';
 import { useStore } from './store';
+import { useAuth } from './auth';
 import { TYPES } from './constants';
 import Clock from './components/Clock';
 import Summary from './components/Summary';
@@ -12,6 +13,7 @@ import Icon from './components/Icon';
 
 export default function App() {
   const { state, dispatch } = useStore();
+  const { user, logout } = useAuth();
   const { filter, editing } = state.ui;
   const { groups, devices } = state.data;
 
@@ -83,6 +85,10 @@ export default function App() {
           </div>
           <Summary />
           <Groups />
+          <div className="rail-user">
+            <span className="rail-user-name">{user.name}</span>
+            <button className="rail-signout" onClick={logout}>Sign out</button>
+          </div>
         </aside>
         <main>
           <Scenes />

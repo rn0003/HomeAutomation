@@ -1,5 +1,7 @@
 import express from 'express';
 import { MongoClient } from 'mongodb';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 
@@ -8,10 +10,14 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 const MONGO_URL = process.env.MONGO_URL || 'mongodb://localhost:27017';
 const DB_NAME = process.env.DB_NAME || 'home_panel';
+const JWT_SECRET = process.env.JWT_SECRET || 'home-panel-jwt-secret-change-in-prod';
+const SALT_ROUNDS = 12;
 
 app.use(express.json());
 
 let db;
+
+const uid = (p) => p + Math.random().toString(36).slice(2, 8);
 
 const SEED_GROUPS = [
   { id: 'g-light', name: 'Lighting', icon: 'bulb' },
@@ -36,82 +42,138 @@ const SEED_DEVICES = [
   { id: 'd13', type: 'plug', name: 'Coffee maker', room: 'Kitchen', group: null, on: false, watts: 900 },
 ];
 
-const strip = (docs) => docs.map(({ _id, ...rest }) => rest);
+const strip = (docs) => docs.map(({ _id, userId, ...rest }) => rest);
 
-async function ensureSeeded() {
-  const count = await db.collection('devices').countDocuments();
-  if (count === 0) {
-    await db.collection('groups').insertMany(SEED_GROUPS.map((g) => ({ ...g })));
-    await db.collection('devices').insertMany(SEED_DEVICES.map((d) => ({ ...d })));
-    console.log('Database seeded with example devices');
-  }
+function signToken(user) {
+  return jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
 }
 
-// GET full state
-app.get('/api/state', async (_req, res) => {
+async function seedForUser(userId) {
+  await db.collection('groups').insertMany(SEED_GROUPS.map((g) => ({ ...g, userId })));
+  await db.collection('devices').insertMany(SEED_DEVICES.map((d) => ({ ...d, userId })));
+}
+
+// ── Auth routes (no token required) ──
+
+app.post('/api/auth/register', async (req, res) => {
+  const { name, email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: 'Email and password are required' });
+  if (!name?.trim()) return res.status(400).json({ error: 'Name is required' });
+  if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+
+  const existing = await db.collection('users').findOne({ email: email.toLowerCase() });
+  if (existing) return res.status(409).json({ error: 'An account with this email already exists' });
+
+  const passwordHash = await bcrypt.hash(password, SALT_ROUNDS);
+  const user = {
+    id: uid('u'),
+    name: name.trim(),
+    email: email.toLowerCase(),
+    passwordHash,
+    createdAt: new Date(),
+  };
+  await db.collection('users').insertOne({ ...user });
+  await seedForUser(user.id);
+
+  const token = signToken(user);
+  res.status(201).json({ token, user: { id: user.id, name: user.name, email: user.email } });
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: 'Email and password are required' });
+
+  const user = await db.collection('users').findOne({ email: email.toLowerCase() });
+  if (!user) return res.status(401).json({ error: 'Invalid email or password' });
+
+  const valid = await bcrypt.compare(password, user.passwordHash);
+  if (!valid) return res.status(401).json({ error: 'Invalid email or password' });
+
+  const token = signToken(user);
+  res.json({ token, user: { id: user.id, name: user.name, email: user.email } });
+});
+
+// ── Auth middleware (all /api routes below require a valid token) ──
+
+app.use('/api', (req, res, next) => {
+  const header = req.headers.authorization;
+  if (!header?.startsWith('Bearer ')) return res.status(401).json({ error: 'Authentication required' });
+  try {
+    const payload = jwt.verify(header.slice(7), JWT_SECRET);
+    req.userId = payload.userId;
+    next();
+  } catch {
+    res.status(401).json({ error: 'Invalid or expired token' });
+  }
+});
+
+// ── Data routes (user-scoped) ──
+
+app.get('/api/state', async (req, res) => {
   const [groups, devices] = await Promise.all([
-    db.collection('groups').find({}).toArray(),
-    db.collection('devices').find({}).toArray(),
+    db.collection('groups').find({ userId: req.userId }).toArray(),
+    db.collection('devices').find({ userId: req.userId }).toArray(),
   ]);
   res.json({ groups: strip(groups), devices: strip(devices) });
 });
 
-// PUT full state (bulk replace — used by scenes, reset, undo)
 app.put('/api/state', async (req, res) => {
   const { groups, devices } = req.body;
-  await db.collection('groups').deleteMany({});
-  await db.collection('devices').deleteMany({});
-  if (groups.length) await db.collection('groups').insertMany(groups.map((g) => ({ ...g })));
-  if (devices.length) await db.collection('devices').insertMany(devices.map((d) => ({ ...d })));
+  await db.collection('groups').deleteMany({ userId: req.userId });
+  await db.collection('devices').deleteMany({ userId: req.userId });
+  if (groups.length)
+    await db.collection('groups').insertMany(groups.map((g) => ({ ...g, userId: req.userId })));
+  if (devices.length)
+    await db.collection('devices').insertMany(devices.map((d) => ({ ...d, userId: req.userId })));
   res.json({ groups, devices });
 });
 
-// PATCH single device
 app.patch('/api/devices/:id', async (req, res) => {
-  await db.collection('devices').updateOne({ id: req.params.id }, { $set: req.body });
-  const doc = await db.collection('devices').findOne({ id: req.params.id });
+  await db.collection('devices').updateOne({ id: req.params.id, userId: req.userId }, { $set: req.body });
+  const doc = await db.collection('devices').findOne({ id: req.params.id, userId: req.userId });
   if (!doc) return res.status(404).json({ error: 'not found' });
-  const { _id, ...device } = doc;
+  const { _id, userId, ...device } = doc;
   res.json(device);
 });
 
-// POST new device
 app.post('/api/devices', async (req, res) => {
-  await db.collection('devices').insertOne({ ...req.body });
-  const { _id, ...device } = req.body;
-  res.status(201).json(device);
+  const device = { ...req.body, userId: req.userId };
+  await db.collection('devices').insertOne({ ...device });
+  const { userId, _id, ...clean } = device;
+  res.status(201).json(clean);
 });
 
-// DELETE device
 app.delete('/api/devices/:id', async (req, res) => {
-  await db.collection('devices').deleteOne({ id: req.params.id });
+  await db.collection('devices').deleteOne({ id: req.params.id, userId: req.userId });
   res.json({ ok: true });
 });
 
-// POST new group
 app.post('/api/groups', async (req, res) => {
-  await db.collection('groups').insertOne({ ...req.body });
-  const { _id, ...group } = req.body;
-  res.status(201).json(group);
+  const group = { ...req.body, userId: req.userId };
+  await db.collection('groups').insertOne({ ...group });
+  const { userId, _id, ...clean } = group;
+  res.status(201).json(clean);
 });
 
-// PATCH group
 app.patch('/api/groups/:id', async (req, res) => {
-  await db.collection('groups').updateOne({ id: req.params.id }, { $set: req.body });
-  const doc = await db.collection('groups').findOne({ id: req.params.id });
+  await db.collection('groups').updateOne({ id: req.params.id, userId: req.userId }, { $set: req.body });
+  const doc = await db.collection('groups').findOne({ id: req.params.id, userId: req.userId });
   if (!doc) return res.status(404).json({ error: 'not found' });
-  const { _id, ...group } = doc;
+  const { _id, userId, ...group } = doc;
   res.json(group);
 });
 
-// DELETE group — moves its devices to group: null
 app.delete('/api/groups/:id', async (req, res) => {
-  await db.collection('devices').updateMany({ group: req.params.id }, { $set: { group: null } });
-  await db.collection('groups').deleteOne({ id: req.params.id });
+  await db.collection('devices').updateMany(
+    { group: req.params.id, userId: req.userId },
+    { $set: { group: null } }
+  );
+  await db.collection('groups').deleteOne({ id: req.params.id, userId: req.userId });
   res.json({ ok: true });
 });
 
-// Static files (production)
+// ── Static files (production) ──
+
 app.use(express.static(join(__dirname, 'dist')));
 app.get('*', (_req, res) => {
   res.sendFile(join(__dirname, 'dist', 'index.html'));
@@ -120,7 +182,11 @@ app.get('*', (_req, res) => {
 async function start() {
   const client = await MongoClient.connect(MONGO_URL);
   db = client.db(DB_NAME);
-  await ensureSeeded();
+
+  await db.collection('users').createIndex({ email: 1 }, { unique: true });
+  await db.collection('devices').createIndex({ userId: 1 });
+  await db.collection('groups').createIndex({ userId: 1 });
+
   app.listen(PORT, () => {
     console.log(`Home Panel API running at http://localhost:${PORT}`);
   });
